@@ -202,6 +202,7 @@ fn lookup_pair(bind: RNode, var: &str) -> EvalResult {
 }
 fn lookup(env: RNode, var: &str) -> EvalResult {
     if env.is_nil() {
+        eprintln!("failed to look up `{var}`");
         Err(EvalError::new(Lookup))
     } else {
         lookup_pair(env.head()?, var).or_else(|_| lookup(env.tail()?, var))
@@ -216,49 +217,6 @@ macro_rules! pop {
     }};
 }
 
-fn builtin_macro(name: &str, env: RNode, args: RNode, trace: &Trace) -> Option<EvalResult> {
-    macro_rules! handle {
-        ($concrete_name:ident, |$env:ident, $args:ident, $trace:ident|, $($name:pat => $handler:expr,)*) => {{
-            match $concrete_name {
-                $(
-                    $name => {
-                        #[allow(unused)]
-                        let handler = |$env: RNode, mut $args: RNode, $trace: &Trace| -> EvalResult {$handler};
-                        Some(handler($env, $args, $trace))
-                    }
-                ),*
-                _ => None,
-            }
-        }}
-    }
-    handle! {
-        name, |env, args, trace|,
-        "quote" => {
-            args.head()
-        },
-        "cond" => {
-            while !args.is_nil() {
-                let mut branch = args.head()?;
-                let condition = pop!(branch);
-                let branch_code = pop!(branch);
-                branch.nil()?;
-
-                if !eval(env.clone(), condition, trace)?.is_nil() {
-                    return eval(env, branch_code, trace);
-                }
-
-                args = args.tail()?;
-            }
-            Ok(parse!(nil))
-        },
-        "eval" => {
-            let env = pop!(args);
-            let expr = pop!(args);
-            args.nil()?;
-            eval(env, expr, trace)
-        },
-    }
-}
 fn evaluate_args(env: &RNode, args: RNode, trace: &Trace) -> EvalResult {
     let mut walker = args;
     let mut rev_args = parse!(nil);
@@ -604,7 +562,21 @@ fn main() {
             ))
             (aux reps elem nil)
         )))
-        (hd (repeat 2000 1))
+        (def iter (lambda (reps func init)(
+            (def aux (lambda (reps func acc val)
+                (cond 
+                    ((lt reps 1) acc)
+                    (1 (aux 
+                        (minus reps 1) 
+                        func 
+                        (cons (func val) acc)
+                        (func val)
+                    ))
+                )
+            ))
+            (rev (aux reps func nil init))
+        )))
+        (iter 10 (lambda (x) (sum x 1)) 0)
     ));
 
     println!("{}", eval(env, prog, &Trace::new(10)).unwrap());
