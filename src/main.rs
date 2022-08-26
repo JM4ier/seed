@@ -8,8 +8,17 @@ enum Node {
 }
 
 macro_rules! parse {
+    (()) => {
+        parse!(nil)
+    };
+    (#$var:expr) => {
+        $var
+    };
     (($hd:tt)) => {
         Rc::new(Node::Cons(parse!($hd), parse!(nil)))
+    };
+    (($hd:tt #$var:tt $($tl:tt)*)) => {
+        Rc::new(Node::Cons(parse!($hd), Rc::new(Node::Cons($var, parse!(($($tl)*))))))
     };
     (($hd:tt $($tl:tt)+ )) => {
         Rc::new(Node::Cons(parse!($hd), parse!(($($tl)+))))
@@ -20,6 +29,13 @@ macro_rules! parse {
     ($sym:ident) => {
         Rc::new(Node::Symbol(stringify!($sym).into()))
     };
+}
+
+#[derive(Clone)]
+struct Trace {
+    ctr: usize,
+    depth: usize,
+    trace: RNode,
 }
 
 impl Node {
@@ -67,7 +83,13 @@ impl Node {
     }
     fn is_lambda(&self) -> bool {
         match self {
-            Self::Cons(lambda, _) => lambda.is_sym("lambda"),
+            Self::Cons(lambda, _) => lambda.is_sym("lambda") || lambda.is_sym("lambdav"),
+            _ => false,
+        }
+    }
+    fn is_variadic(&self) -> bool {
+        match self {
+            Self::Cons(lambda, _) => lambda.is_sym("lambdav"),
             _ => false,
         }
     }
@@ -107,6 +129,14 @@ impl Node {
             )),
             _ => node,
         })
+    }
+    fn truncate(s: &RNode, len: usize) -> RNode {
+        if len <= 1 {s.clone()} else {
+        match &**s {
+            Self::Cons(h, t) => Rc::new(Self::Cons(h.clone(), Self::truncate(t, len - 1))),
+            _ => s.clone(),
+        }
+    }
     }
 }
 
@@ -185,55 +215,101 @@ macro_rules! pop {
         elem
     }};
 }
-fn builtin_macro(name: &str, env: RNode, args: RNode) -> Option<EvalResult> {
-    let cond = |mut args: RNode| {
-        while !args.is_nil() {
-            let mut branch = args.head()?;
-            let condition = pop!(branch);
-            let branch_code = pop!(branch);
-            assert!(branch.is_nil());
 
-            if !eval(env.clone(), condition)?.is_nil() {
-                return Ok(branch_code);
+fn builtin_macro(name: &str, env: RNode, args: RNode, trace: &Trace) -> Option<EvalResult> {
+    macro_rules! handle {
+        ($concrete_name:ident, |$env:ident, $args:ident, $trace:ident|, $($name:pat => $handler:expr,)*) => {{
+            match $concrete_name {
+                $(
+                    $name => {
+                        #[allow(unused)]
+                        let handler = |$env: RNode, mut $args: RNode, $trace: &Trace| -> EvalResult {$handler};
+                        Some(handler($env, $args, $trace))
+                    }
+                ),*
+                _ => None,
             }
-
-            args = args.tail()?;
-        }
-        Ok(parse!(nil))
-    };
-
-    let eval1 = |mut args: RNode| {
-        let env = pop!(args);
-        let expr = pop!(args);
-        args.nil()?;
-        eval(env, expr)
-    };
-
-    let handler: &dyn Fn(RNode) -> EvalResult = match name {
-        "cond" => &cond,
-        "eval" => &eval1,
-        _ => return None,
-    };
-
-    let expanded = match handler(args) {
-        Ok(o) => o,
-        Err(e) => return Some(Err(e)),
-    };
-    Some(eval(env.clone(), expanded))
-}
-fn builtin_func(name: &str, env: RNode, mut args: RNode) -> Option<EvalResult> {
-    fn evaluate_args(env: &RNode, args: RNode) -> EvalResult {
-        if args.is_nil() {
-            Ok(parse!(nil))
-        } else {
-            let arg = eval(env.clone(), args.head()?)?;
-            let args = evaluate_args(env, args.tail()?)?;
-            Ok(Rc::new(Node::Cons(arg, args)))
-        }
+        }}
     }
-    args = match evaluate_args(&env, args) {
+    handle! {
+        name, |env, args, trace|,
+        "quote" => {
+            args.head()
+        },
+        "cond" => {
+            while !args.is_nil() {
+                let mut branch = args.head()?;
+                let condition = pop!(branch);
+                let branch_code = pop!(branch);
+                branch.nil()?;
+
+                if !eval(env.clone(), condition, trace)?.is_nil() {
+                    return eval(env, branch_code, trace);
+                }
+
+                args = args.tail()?;
+            }
+            Ok(parse!(nil))
+        },
+        "eval" => {
+            let env = pop!(args);
+            let expr = pop!(args);
+            args.nil()?;
+            eval(env, expr, trace)
+        },
+    }
+}
+fn evaluate_args(env: &RNode, args: RNode, trace: &Trace) -> EvalResult {
+    let mut walker = args;
+    let mut rev_args = parse!(nil);
+
+    while !walker.is_nil() {
+        let arg = walker.head()?;
+        rev_args = Rc::new(Node::Cons(arg, rev_args));
+        walker = walker.tail()?;
+    }
+
+    let mut walker = rev_args;
+    let mut eval_args = parse!(nil);
+
+    while !walker.is_nil() {
+        let arg = walker.head()?;
+        let arg  = eval(env.clone(), arg, trace)?;
+        eval_args = Rc::new(Node::Cons(arg, eval_args));
+        walker = walker.tail()?;
+    }
+
+    Ok(eval_args)
+}
+fn builtin_func(name: &str, env: RNode, mut args: RNode, trace: &Trace) -> Option<EvalResult> {
+    args = match evaluate_args(&env, args, trace) {
         Ok(a) => a,
         Err(e) => return Some(Err(e)),
+    };
+    let nilp = |mut args: RNode| {
+        let x = pop!(args);
+        args.nil()?;
+        if x.is_nil() {
+            Ok(parse!(1))
+        } else {
+            Ok(parse!(nil))
+        }
+    };
+    let hd = |mut args: RNode| {
+        let list = pop!(args);
+        args.nil()?;
+        list.head()
+    };
+    let tl = |mut args: RNode| {
+        let list = pop!(args);
+        args.nil()?;
+        list.tail()
+    };
+    let cons = |mut args: RNode| {
+        let head = pop!(args);
+        let tail = pop!(args);
+        args.nil()?;
+        Ok(Rc::new(Node::Cons(head, tail)))
     };
     let sum = |mut args: RNode| {
         let mut s = 0;
@@ -251,7 +327,7 @@ fn builtin_func(name: &str, env: RNode, mut args: RNode) -> Option<EvalResult> {
     };
     let lt = |mut args: RNode| {
         if args.is_nil() {
-            Ok(Rc::new(Node::Int(1)))
+            Ok(parse!(1))
         } else {
             let mut a = pop!(args).int()?;
             while !args.is_nil() {
@@ -261,7 +337,7 @@ fn builtin_func(name: &str, env: RNode, mut args: RNode) -> Option<EvalResult> {
                 }
                 a = x;
             }
-            Ok(Rc::new(Node::Int(1)))
+            Ok(parse!(1))
         }
     };
     let minus = |mut args: RNode| {
@@ -271,6 +347,11 @@ fn builtin_func(name: &str, env: RNode, mut args: RNode) -> Option<EvalResult> {
         Ok(Rc::new(Node::Int(lhs - rhs)))
     };
     Some(match name {
+        "hd" => hd(args),
+        "tl" => tl(args),
+        "nilp" => nilp(args),
+        "cons" => cons(args),
+        "list" => Ok(args),
         "sum" => sum(args),
         "prod" => prod(args),
         "lt" => lt(args),
@@ -278,9 +359,49 @@ fn builtin_func(name: &str, env: RNode, mut args: RNode) -> Option<EvalResult> {
         _ => return None,
     })
 }
-fn eval(env: RNode, value: RNode) -> EvalResult {
-    fn inner(env: RNode, value: RNode) -> EvalResult {
-        Ok(match &*value {
+
+impl Trace {
+    fn new(depth: usize) -> Self {
+        Self {
+            depth,
+            trace: parse!(nil),
+            ctr: 0,
+        }
+    }
+    fn log(&self, value: &RNode) -> Self {
+        if self.depth == 0 {
+            return self.clone()
+        }
+        let mut ctr = self.ctr + 1;
+        let mut trace = self.trace.clone();
+        if ctr % self.depth == 0 {
+            ctr = self.depth;
+            trace = Node::truncate(&trace, self.depth);
+        }
+        trace = Rc::new(Node::Cons(value.clone(), trace));
+        Self {
+            ctr,trace, depth: self.depth
+        }
+    }
+}
+
+fn eval(mut env: RNode, mut value: RNode, trace: &Trace) -> EvalResult {
+    let mut cloned_trace = trace.clone();
+
+    
+    'eval: loop {
+        macro_rules! eval {
+            ($env:expr, $value:expr) => {{
+                env = $env;
+                value = $value;
+                continue 'eval;
+            }}
+        }
+
+        cloned_trace = cloned_trace.log(&value);
+        let trace = &cloned_trace;
+
+        break Ok(match &*value {
             _ if value.is_nil() || value.is_lambda() => value,
             Node::Int(_) => value,
             Node::Symbol(var) => lookup(env, var)?,
@@ -292,28 +413,50 @@ fn eval(env: RNode, value: RNode) -> EvalResult {
                 let def_val = pop!(def);
                 def.nil()?;
 
-                let def_val_eval = eval(env.clone(), def_val)?;
-                let env = Rc::new(Node::Cons(Rc::new(Node::Cons(def_var, def_val_eval)), env));
-
-                eval(env, prog.clone())?
+                let def_val_eval = eval(env.clone(), def_val, trace)?;
+                let new_env = Rc::new(Node::Cons(Rc::new(Node::Cons(def_var, def_val_eval)), env));
+                eval!(new_env, prog.clone())
             }
             Node::Cons(func, concrete_args) => {
                 let mut concrete_args = concrete_args.clone();
 
                 if let &Node::Symbol(..) = &**func {
-                    if let Some(result) =
-                        builtin_macro(func.sym()?, env.clone(), concrete_args.clone())
-                    {
-                        return result;
+                    let mut args = concrete_args.clone();
+                    match func.sym()? {
+                        "quote" => {
+                            return args.head()
+                        },
+                        "cond" => {
+                            while !args.is_nil() {
+                                let mut branch = args.head()?;
+                                let condition = pop!(branch);
+                                let branch_code = pop!(branch);
+                                branch.nil()?;
+
+                                if !eval(env.clone(), condition, trace)?.is_nil() {
+                                    eval!(env, branch_code);
+                                }
+
+                                args = args.tail()?;
+                            }
+                            return Ok(parse!(nil))
+                        },
+                        "eval" => {
+                            let env = pop!(args);
+                            let expr = pop!(args);
+                            args.nil()?;
+                            eval!(env, expr)
+                        },
+                        _ => (),
                     }
                     if let Some(result) =
-                        builtin_func(func.sym()?, env.clone(), concrete_args.clone())
+                        builtin_func(func.sym()?, env.clone(), concrete_args.clone(), trace)
                     {
                         return result;
                     }
                 }
 
-                let func = eval(env.clone(), func.clone())?;
+                let func = eval(env.clone(), func.clone(), trace)?;
 
                 if !func.is_lambda() {
                     concrete_args.nil()?;
@@ -321,6 +464,7 @@ fn eval(env: RNode, value: RNode) -> EvalResult {
                 }
 
                 // get rid of the preceding `lambda`
+                let variadic = func.is_variadic();
                 let func = func.tail()?;
 
                 let mut formal_args = func
@@ -333,73 +477,135 @@ fn eval(env: RNode, value: RNode) -> EvalResult {
 
                 while !formal_args.is_nil() {
                     let f_arg = pop!(formal_args);
-                    let c_arg = eval(env.clone(), pop!(concrete_args))?;
-                    body = Node::beta(body, f_arg.sym()?, c_arg)?;
+                    let c_arg = if formal_args.is_nil() && variadic {
+                        let args = evaluate_args(&env, concrete_args.clone(), trace)?;
+                        concrete_args = parse!(nil);
+                        args
+                    } else {
+                        eval(env.clone(), pop!(concrete_args), trace)? 
+                    };
+                    body = Node::beta(body, f_arg.sym()?, parse!((quote #c_arg)))?;
                 }
 
                 concrete_args.nil()?;
-
-                eval(env, body)?
+                eval!(env, body)
             }
         })
     }
-    let res = inner(env.clone(), value.clone());
-    if res.is_err() {
-        eprintln!("Failed to evaluate `{value}` in environment `{env}`");
-    }
-    res
 }
 
 macro_rules! test {
-    ($res:tt = $($expr:tt)*) => {{
-        let env = parse!(nil);
-        let expr = parse!($($expr)*);
-        let expected = parse!($res);
-        let evaluated = eval(env, expr).unwrap();
-        assert_eq!(expected, evaluated);
-    }}
+    ($name:ident : $res:tt = $($expr:tt)*) => {
+        #[test]
+        fn $name() {
+            let env = parse!(nil);
+            let expr = parse!($($expr)*);
+            let expected = parse!($res);
+            let evaluated = eval(env, expr, &Trace::new(0)).unwrap();
+            assert_eq!(expected, evaluated);
+        }
+    }
 }
 
-#[test]
-fn simple_tests() {
-    test!(42 = ((lambda (x) x) 42));
-    test!(0 = (((lambda (x) x) (lambda (x) x)) 0));
-    test!(69 = ((lambda (x y) y) 68 69));
-    test!(68 = ((lambda (x y) x) 68 69));
-    test!(1 = (
-        cond
-        (nil 2)
-        (42 1)
-    ));
-    test!(10 = (sum 1 2 3 4));
-    test!(24 = (prod 1 2 3 4));
-    test!(43 = (sum 1 (sum 42)));
-    test!(1 = ((lambda (x) ((lambda (x) x) x)) 1));
-    test!(1 = (eval nil 1));
-    test!(13 = (
-        (def x 13)
-        x
-    ));
-}
+test!(fun_app_1 : 42 = ((lambda (x) x) 42));
+test!(fun_app_2 : 0 = (((lambda (x) x) (lambda (x) x)) 0));
+test!(fun_app_2_args_1 : 69 = ((lambda (x y) y) 68 69));
+test!(fun_app_2_args_2 : 68 = ((lambda (x y) x) 68 69));
+test!(cond1 : 1 = (
+    cond
+    (nil 2)
+    (42 1)
+));
+test!(sum1: 10 = (sum 1 2 3 4));
+test!(prod1: 24 = (prod 1 2 3 4));
+test!(sum_with_evaluated_args: 43 = (sum 1 (sum 42)));
+test!(lambda_with_same_varname : 1 = ((lambda (x) ((lambda (x) x) x)) 1));
+test!(eval1 : 1 = (eval nil 1));
+test!(def1 : 13 = (
+    (def x 13)
+    x
+));
+
+test!(long_list : 1 = (
+    (def repeat (lambda (reps elem)(
+        (def aux (lambda (reps elem acc)
+            (cond
+                ((lt reps 1) acc)
+                (1 (aux (minus reps 1) elem (cons elem acc)))
+            )
+        ))
+        (aux reps elem nil)
+    )))
+    (hd (repeat 40000 1))
+));
 
 fn main() {
     let env = parse!(nil);
     let prog = parse!((
         (def t 1)
-        (def and (lambda (a b) (cond (a b))))
-        (def or (lambda (a b) (cond (a t) (b t))))
-        (def not (lambda (x) (cond (x nil) (t t))))
-        (def fib 
-            (lambda (x) 
-            (cond
-                ((lt x 2) x)
-                (t (sum 
-                    (fib (minus x 1)) 
-                    (fib (minus x 2))
+        (def and (lambdav (bs)(
+            (def aux (lambda (bs)
+                (cond 
+                    ((nilp bs) t)
+                    (t (cond ((hd bs) (aux (tl bs)))))
+                )))
+            (aux bs)
+        )))
+        (def or (lambdav (bs)(
+            (def aux (lambda (bs)
+                (cond 
+                    ((nilp bs) nil)
+                    (t (
+                        cond 
+                        ((hd bs) t)
+                        (t (aux (tl bs))))
+                    )
                 ))
             )
+            (aux bs)
+        )))
+        (def not (lambda (x) (cond (x nil) (t t))))
+        (def fib 
+            (lambda (x)(
+            (def aux (lambda (x a b)
+                (cond 
+                    ((lt x 1) a)
+                    (t (aux (minus x 1) (sum a b) a))
+            )))
+            (aux x 0 1)
+        )))
+        (def concat (lambda (xs ys)
+            (cond
+                ((nilp xs) ys)
+                (t (cons (hd xs) (concat (tl xs) ys)))
+            )
         ))
-        (fib 20)
+        (def rev (lambda (ls)(
+            (def aux (lambda (ls ts)
+                (cond
+                    ((nilp ls) ts)
+                    (t (aux (tl ls) (cons (hd ls) ts)))
+                )
+            ))
+            (aux ls nil)
+        )))
+        (def fibs (lambda (x)
+            (cond
+                ((lt x 1) nil)
+                (t (cons (list x (fib x)) (fibs (minus x 1))))
+            )
+        ))
+        (def repeat (lambda (reps elem)(
+            (def aux (lambda (reps elem acc)
+                (cond
+                    ((lt reps 1) acc)
+                    (1 (aux (minus reps 1) elem (cons elem acc)))
+                )
+            ))
+            (aux reps elem nil)
+        )))
+        (hd (repeat 2000 1))
     ));
-    println!("{}", eval(env, prog).unwrap());
+
+    println!("{}", eval(env, prog, &Trace::new(10)).unwrap());
 }
