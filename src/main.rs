@@ -245,11 +245,7 @@ fn evaluate_args(env: &RNode, args: RNode, trace: &Trace) -> EvalResult {
 
     Ok(eval_args)
 }
-fn builtin_func(name: &str, env: RNode, mut args: RNode, trace: &Trace) -> Option<EvalResult> {
-    args = match evaluate_args(&env, args, trace) {
-        Ok(a) => a,
-        Err(e) => return Some(Err(e)),
-    };
+fn builtin_func(name: &str, env: RNode, args: RNode, trace: &Trace) -> Option<EvalResult> {
     let nilp = |mut args: RNode| {
         let x = pop!(args);
         args.nil()?;
@@ -310,19 +306,37 @@ fn builtin_func(name: &str, env: RNode, mut args: RNode, trace: &Trace) -> Optio
         args.nil()?;
         Ok(Rc::new(Node::Int(lhs - rhs)))
     };
-    Some(match name {
-        "hd" => hd(args),
-        "tl" => tl(args),
-        "nilp" => nilp(args),
-        "cons" => cons(args),
-        "list" => Ok(args),
-        "sum" => sum(args),
-        "prod" => prod(args),
-        "lt" => lt(args),
-        "<" => lt(args),
-        "minus" => minus(args),
-        _ => return None,
-    })
+    let list = |args| Ok(args);
+    macro_rules! matcher {
+        ($($name:literal => $handler:tt),*) => {
+            match name {
+                $(
+                    $name => {
+                        let args = match evaluate_args(&env, args, trace) {
+                            Ok(a) => a,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        Some($handler(args))
+                    }
+                ),*
+                _ => None
+            }
+        }
+    }
+    matcher! {
+        "hd" => hd,
+        "tl" => tl,
+        "nilp" => nilp,
+        "cons" => cons,
+        "list" => list,
+        "sum" => sum,
+        "+" => sum,
+        "prod" => prod,
+        "lt" => lt,
+        "<" => lt,
+        "-" => minus,
+        "minus" => minus
+    }
 }
 
 impl Trace {
@@ -365,6 +379,8 @@ fn eval(mut env: RNode, mut value: RNode, trace: &Trace) -> EvalResult {
 
         cloned_trace = cloned_trace.log(&value);
         let trace = &cloned_trace;
+
+        eprintln!("{value}");
 
         break Ok(match &*value {
             _ if value.is_nil() || value.is_lambda() || value.is_macro() => value,
@@ -604,8 +620,12 @@ fn main() {
                 (1 else_block)
             )
         ))
+        (def let (macro (var val body)
+            ((lambda (var) body) val)
+        ))
         //(iter 10 (lambda (x) (sum x 1)) 0)
-        (if 1 (list 1 2 3) 420)
+        //(if 1 (list 1 2 3) 420)
+        (let x 10 x)
     ));
 
     println!("{}", eval(env, prog, &Trace::new(10)).unwrap());
