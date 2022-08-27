@@ -26,7 +26,7 @@ macro_rules! parse {
     ($int:literal) => {
         Rc::new(Node::Int($int))
     };
-    ($sym:ident) => {
+    ($sym:tt) => {
         Rc::new(Node::Symbol(stringify!($sym).into()))
     };
 }
@@ -87,9 +87,15 @@ impl Node {
             _ => false,
         }
     }
+    fn is_macro(&self) -> bool {
+        match self {
+            Self::Cons(m, _) => m.is_sym("macro") || m.is_sym("macrov"),
+            _ => false,
+        }
+    }
     fn is_variadic(&self) -> bool {
         match self {
-            Self::Cons(lambda, _) => lambda.is_sym("lambdav"),
+            Self::Cons(sym, _) => sym.is_sym("lambdav") || sym.is_sym("macrov"),
             _ => false,
         }
     }
@@ -313,6 +319,7 @@ fn builtin_func(name: &str, env: RNode, mut args: RNode, trace: &Trace) -> Optio
         "sum" => sum(args),
         "prod" => prod(args),
         "lt" => lt(args),
+        "<" => lt(args),
         "minus" => minus(args),
         _ => return None,
     })
@@ -360,7 +367,7 @@ fn eval(mut env: RNode, mut value: RNode, trace: &Trace) -> EvalResult {
         let trace = &cloned_trace;
 
         break Ok(match &*value {
-            _ if value.is_nil() || value.is_lambda() => value,
+            _ if value.is_nil() || value.is_lambda() || value.is_macro() => value,
             Node::Int(_) => value,
             Node::Symbol(var) => lookup(env, var)?,
             Node::Cons(def, prog) if def.is_def() => {
@@ -416,13 +423,14 @@ fn eval(mut env: RNode, mut value: RNode, trace: &Trace) -> EvalResult {
 
                 let func = eval(env.clone(), func.clone(), trace)?;
 
-                if !func.is_lambda() {
+                if !func.is_lambda()  && !func.is_macro() {
                     concrete_args.nil()?;
                     return Ok(func);
                 }
 
                 // get rid of the preceding `lambda`
                 let variadic = func.is_variadic();
+                let is_macro = func.is_macro();
                 let func = func.tail()?;
 
                 let mut formal_args = func
@@ -436,17 +444,31 @@ fn eval(mut env: RNode, mut value: RNode, trace: &Trace) -> EvalResult {
                 while !formal_args.is_nil() {
                     let f_arg = pop!(formal_args);
                     let c_arg = if formal_args.is_nil() && variadic {
-                        let args = evaluate_args(&env, concrete_args.clone(), trace)?;
+                        let args = 
+                        if is_macro {
+                            concrete_args.clone()
+                        } else {
+                           evaluate_args(&env, concrete_args.clone(), trace)?
+                        };
                         concrete_args = parse!(nil);
                         args
                     } else {
-                        eval(env.clone(), pop!(concrete_args), trace)? 
+                        if is_macro {
+                            pop!(concrete_args)
+                        } else {
+                            eval(env.clone(), pop!(concrete_args), trace)? 
+                        }
                     };
                     body = Node::beta(body, f_arg.sym()?, parse!((quote #c_arg)))?;
                 }
 
                 concrete_args.nil()?;
-                eval!(env, body)
+                if is_macro {
+                    let body = eval(env.clone(), body, trace)?;
+                    eval!(env, body)
+                } else {
+                    eval!(env, body)
+                }
             }
         })
     }
@@ -565,7 +587,7 @@ fn main() {
         (def iter (lambda (reps func init)(
             (def aux (lambda (reps func acc val)
                 (cond 
-                    ((lt reps 1) acc)
+                    ((< reps 1) acc)
                     (1 (aux 
                         (minus reps 1) 
                         func 
@@ -576,7 +598,14 @@ fn main() {
             ))
             (rev (aux reps func nil init))
         )))
-        (iter 10 (lambda (x) (sum x 1)) 0)
+        (def if (macro (c then_block else_block)
+            (cond
+                (c then_block)
+                (1 else_block)
+            )
+        ))
+        //(iter 10 (lambda (x) (sum x 1)) 0)
+        (if 1 (list 1 2 3) 420)
     ));
 
     println!("{}", eval(env, prog, &Trace::new(10)).unwrap());
